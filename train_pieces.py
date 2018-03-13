@@ -151,10 +151,6 @@ def main():
   sess = tf.Session()
   sess.run(tf.global_variables_initializer())
 
-  for i in range(100):
-    _, loss_value = sess.run((train, loss))
-    print('Step:', i, 'loss:', loss_value)
-
 
 if __name__ == '__main__':
     main()
