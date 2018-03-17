@@ -34,7 +34,8 @@ def pair_cosine_loss(tensor, labels, num_pairs):
     conv_1_float = math_ops.to_float(conv_1_normal)
     conv_2_float = math_ops.to_float(conv_2_normal)
     radial_diffs = math_ops.multiply(conv_1_float, conv_2_float)
-    diffs = 1 - math_ops.reduce_sum(radial_diffs, axis=[1], keep_dims=True)
+    # diffs = 1 - math_ops.reduce_sum(radial_diffs, axis=[1], keep_dims=True)
+    diffs = math_ops.reduce_sum(radial_diffs, axis=[1], keep_dims=True)
 
     # diffs has shape [num_pairs]
 
@@ -43,13 +44,36 @@ def pair_cosine_loss(tensor, labels, num_pairs):
 
     # labels_1 and labels_2 have shape [num_pairs]
 
+    # Three variations on the loss function.
+    # 1: absolute value, only different labels
+
     # Throw out pairs where the labels match, because we just want
     # different labels to have different outputs.
     labels_eq = math_ops.equal(labels_1, labels_2)
-    different_diffs = tf.boolean_mask(diffs, labels_eq)
-    loss = math_ops.reduce_sum(tf.abs(different_diffs))
 
-    return loss
+    # Mixing check
+    num_diff = tf.count_nonzero(labels_eq)
+
+    different_diffs = tf.boolean_mask(diffs, tf.logical_not(labels_eq))
+    loss1 = math_ops.reduce_sum(tf.abs(different_diffs))
+
+    # 2: absolute value, all labels
+    # If labels are equal, flip sign so that minimization makes
+    # same-label elements closer, not farther away.
+    all_to_minimize = tf.multiply(
+        diffs,
+        tf.where(labels_eq,
+                 x=tf.ones([num_pairs]) * -1,
+                 y=tf.ones([num_pairs])))
+    loss2 = math_ops.reduce_sum(tf.abs(all_to_minimize))
+
+    # 3: no absolute value, all labels
+    loss3 = math_ops.reduce_sum(all_to_minimize)
+
+    # 4: just equal labels. flip sign
+    loss4 = math_ops.reduce_sum(tf.boolean_mask(diffs, labels_eq)) * -1
+
+    return [tf.divide(num_diff, num_pairs)], [loss1, loss2, loss3, loss4]
 
 
 def generate_graph(data, labels):
@@ -81,7 +105,8 @@ def generate_graph(data, labels):
 
     # Shape: 2N x 28 x 28 x 32.
 
-    losses.append(pair_cosine_loss(conv1, labels, num_pairs))
+    data, losses1 = pair_cosine_loss(conv1, labels, num_pairs)
+    losses.extend(losses1)
 
     # Pooling Layer #1
     pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
@@ -94,7 +119,8 @@ def generate_graph(data, labels):
         padding="same",
         activation=tf.nn.relu)
 
-    losses.append(pair_cosine_loss(conv2, labels, num_pairs))
+    _, losses2 = pair_cosine_loss(conv2, labels, num_pairs)
+    losses.extend(losses2)
 
     pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
 
@@ -103,7 +129,8 @@ def generate_graph(data, labels):
     dense = tf.layers.dense(inputs=pool2_flat, units=1024,
                             activation=tf.nn.relu)
 
-    losses.append(pair_cosine_loss(dense, labels, num_pairs))
+    _, losses3 = pair_cosine_loss(dense, labels, num_pairs)
+    losses.extend(losses3)
 
     dropout = tf.layers.dropout(inputs=dense, rate=0.4, training=True)
 
@@ -114,7 +141,7 @@ def generate_graph(data, labels):
     losses.append(
         tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits))
 
-    return losses
+    return data, losses
 
 
 def get_features_labels():
@@ -123,16 +150,16 @@ def get_features_labels():
   train_labels = np.asarray(mnist.train.labels, dtype=np.int32)
 
   dataset = tf.data.Dataset.from_tensor_slices((train_data, train_labels))
-  dataset_2 = dataset.shuffle(1000).repeat().batch(BATCH_SIZE)
+  dataset_2 = dataset.shuffle(55000).repeat().batch(BATCH_SIZE)
   features, labels = dataset_2.make_one_shot_iterator().get_next()
 
   return features, labels
 
 
-def train(sess, trains, losses, idx):
-    ops_to_eval = [trains[idx]] + [losses[i] for i in range(idx + 1)]
+def train_last(sess, trains, losses, num_iterations=100):
+    ops_to_eval = [trains[-1]] + losses
 
-    for i in range(100):
+    for i in range(num_iterations):
         vals = sess.run(tuple(ops_to_eval))
         print('Step:', i, 'losses:', vals[1:])
 
@@ -140,7 +167,7 @@ def train(sess, trains, losses, idx):
 def main():
   features, labels = get_features_labels()
 
-  losses = generate_graph(features, labels)
+  data, losses = generate_graph(features, labels)
 
   optimizer = tf.train.GradientDescentOptimizer(0.001)
 
