@@ -7,7 +7,111 @@ from tensorflow.python.ops import math_ops
 
 BATCH_SIZE = 200
 
-def pair_cosine_loss(tensor, labels, num_pairs):
+### HOW THIS WORKS
+#
+# generate_graph generates an MNIST CNN model graph. The parts that do
+# work are the same as in the Tensorflow documentation at
+# https://www.tensorflow.org/tutorials/layers.
+#
+# It also adds the ability to insert monitoring ops after every
+# layer. The 'run_test' function will print these out after every
+# step, which makes it possible to investigate different parts of the
+# training process. 'generate_and_test' is a convenience function
+# which encapsulates the whole workflow.
+
+
+def generate_graph(data, labels, monitors):
+    """Generate the graph.
+
+    Args:
+      data: the input data tensor.
+      labels: the input labels tensor.
+      monitors: a list of functions. The functions will be applied to
+        the intermediate tensors at every stage of the graph, and
+        should return a dict of {name, tensor} pairs, to be used as
+        monitors.
+
+    Returns: a tuple of (loss, monitor_ops). The loss is an overall
+      loss for the graph.
+
+    """
+
+    losses = []
+    num_pairs = BATCH_SIZE // 2
+    monitor_ops = {}
+
+    def add_monitor_ops(tensor, in_tensor, layer_num):
+        for func in monitors:
+            ops = func(tensor,
+                       labels=labels,
+                       num_pairs=num_pairs,
+                       in_tensor=in_tensor)
+            for op_name, op in ops.items():
+                monitor_ops[op_name + str(layer_num)] = op
+
+    # Data is 2 x N x 28 x 28.
+    #  2 is because we want pairs of images
+    #  N is the batch size
+    #  28 x 28 are the pixels for each image
+
+    # Labels is 2 x N
+
+    # layers.conv2d wants a simple array of images to work with, so
+    # here we go
+    conv_input = tf.reshape(data, [-1, 28, 28, 1])
+
+    # conv_input is 2N x 28 x 28 x 1
+
+    # Convolutional Layer.
+    conv1 = tf.layers.conv2d(
+      inputs=conv_input,
+      filters=32,
+      kernel_size=[5, 5],
+      padding="same",
+      activation=tf.nn.relu)
+
+    # Shape: 2N x 28 x 28 x 32.
+
+    add_monitor_ops(conv1, conv_input, 0)
+
+    # Pooling Layer #1
+    pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
+
+    # Convolutional Layer #2 and Pooling Layer #2
+    conv2 = tf.layers.conv2d(
+        inputs=pool1,
+        filters=64,
+        kernel_size=[5, 5],
+        padding="same",
+        activation=tf.nn.relu)
+
+    add_monitor_ops(conv2, conv1, 1)
+
+    pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
+
+    # Dense Layer
+    pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
+    dense = tf.layers.dense(inputs=pool2_flat, units=1024,
+                            activation=tf.nn.relu)
+
+    add_monitor_ops(dense, conv2, 2)
+
+    dropout = tf.layers.dropout(inputs=dense, rate=0.4, training=True)
+
+    # Logits Layer
+    logits = tf.layers.dense(inputs=dropout, units=10)
+
+    add_monitor_ops(logits, dense, 3)
+
+    # Calculate Overall Loss
+    loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
+
+    return loss, monitor_ops
+
+
+## Cosine loss-based monitor ops
+
+def pair_cosine_loss(tensor, labels=None, num_pairs=None, **kwargs):
     """Generate a cosine loss function for a tensor of pairs.
 
     Args:
@@ -51,9 +155,6 @@ def pair_cosine_loss(tensor, labels, num_pairs):
     # different labels to have different outputs.
     labels_eq = math_ops.equal(labels_1, labels_2)
 
-    # Mixing check
-    num_diff = tf.count_nonzero(labels_eq)
-
     different_diffs = tf.boolean_mask(diffs, tf.logical_not(labels_eq))
     loss1 = math_ops.reduce_sum(tf.abs(different_diffs))
 
@@ -73,75 +174,39 @@ def pair_cosine_loss(tensor, labels, num_pairs):
     # 4: just equal labels. flip sign
     loss4 = math_ops.reduce_sum(tf.boolean_mask(diffs, labels_eq)) * -1
 
-    return [tf.divide(num_diff, num_pairs)], [loss1, loss2, loss3, loss4]
+    return {'abs(diff)': loss1,
+            'abs(all)': loss2,
+            'all': loss3,
+            'equal': loss4}
 
 
-def generate_graph(data, labels):
-    """Generate the graph, with multiple loss functions."""
+## Make sure the model isn't sending all the vectors to zero.
 
-    losses = []
-    num_pairs = BATCH_SIZE // 2
+def norm_ratio(tensor, num_pairs=None, in_tensor=None, **kwargs):
+    in_flat = tf.reshape(in_tensor, [num_pairs * 2, -1])
+    out_flat = tf.reshape(tensor, [num_pairs * 2, -1])
 
-    # Data is 2 x N x 28 x 28.
-    #  2 is because we want pairs of images
-    #  N is the batch size
-    #  28 x 28 are the pixels for each image
+    return {'norm ratio': tf.divide(tf.norm(out_flat, axis=1),
+                                    tf.norm(in_flat, axis=1))}
 
-    # Labels is 2 x N
 
-    # layers.conv2d wants a simple array of images to work with, so
-    # here we go
-    conv_input = tf.reshape(data, [-1, 28, 28, 1])
+def run_test(sess, train, monitor_ops, num_iterations=1000):
+    for i in range(num_iterations):
+        _, monitors = sess.run((train, monitor_ops))
+        print('Step', i, ':', monitors)
 
-    # conv_input is 2N x 28 x 28 x 1
 
-    # Convolutional Layer.
-    conv1 = tf.layers.conv2d(
-      inputs=conv_input,
-      filters=32,
-      kernel_size=[5, 5],
-      padding="same",
-      activation=tf.nn.relu)
+def generate_and_test(features, labels, sess):
+    loss, monitor_ops = generate_graph(
+        features, labels,
+        [pair_cosine_loss, norm_ratio])
 
-    # Shape: 2N x 28 x 28 x 32.
+    optimizer = tf.train.GradientDescentOptimizer(0.001)
+    train = optimizer.minimize(loss)
 
-    data, losses1 = pair_cosine_loss(conv1, labels, num_pairs)
-    losses.extend(losses1)
+    sess.run(tf.global_variables_initializer())
 
-    # Pooling Layer #1
-    pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
-
-    # Convolutional Layer #2 and Pooling Layer #2
-    conv2 = tf.layers.conv2d(
-        inputs=pool1,
-        filters=64,
-        kernel_size=[5, 5],
-        padding="same",
-        activation=tf.nn.relu)
-
-    _, losses2 = pair_cosine_loss(conv2, labels, num_pairs)
-    losses.extend(losses2)
-
-    pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
-
-    # Dense Layer
-    pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
-    dense = tf.layers.dense(inputs=pool2_flat, units=1024,
-                            activation=tf.nn.relu)
-
-    _, losses3 = pair_cosine_loss(dense, labels, num_pairs)
-    losses.extend(losses3)
-
-    dropout = tf.layers.dropout(inputs=dense, rate=0.4, training=True)
-
-    # Logits Layer
-    logits = tf.layers.dense(inputs=dropout, units=10)
-
-    # Calculate Overall Loss
-    losses.append(
-        tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits))
-
-    return data, losses
+    run_test(sess, train, monitor_ops)
 
 
 def get_features_labels():
@@ -156,27 +221,11 @@ def get_features_labels():
   return features, labels
 
 
-def train_last(sess, trains, losses, num_iterations=100):
-    ops_to_eval = [trains[-1]] + losses
-
-    for i in range(num_iterations):
-        vals = sess.run(tuple(ops_to_eval))
-        print('Step:', i, 'losses:', vals[1:])
-
-
 def main():
   features, labels = get_features_labels()
 
-  data, losses = generate_graph(features, labels)
-
-  optimizer = tf.train.GradientDescentOptimizer(0.001)
-
-  # Choo-choo!
-  trains = [optimizer.minimize(loss)
-            for loss in losses]
-
   sess = tf.Session()
-  sess.run(tf.global_variables_initializer())
+  generate_and_test(features, labels, sess)
 
 
 if __name__ == '__main__':
