@@ -1,5 +1,6 @@
 #!python
 
+import csv
 import tensorflow as tf
 import numpy as np
 
@@ -186,27 +187,68 @@ def norm_ratio(tensor, num_pairs=None, in_tensor=None, **kwargs):
     in_flat = tf.reshape(in_tensor, [num_pairs * 2, -1])
     out_flat = tf.reshape(tensor, [num_pairs * 2, -1])
 
-    return {'norm ratio': tf.divide(tf.norm(out_flat, axis=1),
-                                    tf.norm(in_flat, axis=1))}
+    ratios = tf.divide(tf.norm(out_flat, axis=1),
+                       tf.norm(in_flat, axis=1))
+
+    return {'norm ratio min': tf.reduce_min(ratios),
+            'norm ratio max': tf.reduce_max(ratios)}
 
 
-def run_test(sess, train, monitor_ops, num_iterations=1000):
+def mean_based(tensor, labels=None, num_pairs=None, **kwargs):
+    num_rows = num_pairs * 2
+    flat_tensor = tf.reshape(tensor, [num_rows, -1])
+
+    rows_by_label = [
+        tf.boolean_mask(flat_tensor, tf.equal(labels, i))
+        for i in range(10)]
+
+    means_by_label = [
+        tf.reduce_mean(rows_by_label[i], axis=0)
+        for i in range(10)]
+
+    stacked_means = tf.stack(means_by_label)
+    means_for_rows = tf.gather(stacked_means, labels)
+
+    return {
+        'not normalized': tf.reduce_sum(
+            tf.subtract(flat_tensor, means_for_rows)),
+        'cosine': tf.reduce_sum(
+            tf.losses.cosine_distance(
+                tf.nn.l2_normalize(flat_tensor, axis=1),
+                tf.nn.l2_normalize(means_for_rows, axis=1),
+                axis=1))}
+
+
+COLUMNS = ['step', 'monitor', 'value']
+
+def run_test(sess, train, monitor_ops, fp, num_iterations=1000):
+    writer = csv.DictWriter(fp, COLUMNS)
+    writer.writeheader()
+
     for i in range(num_iterations):
+        if i % 10 == 0:
+            print('Starting step', i)
+
         _, monitors = sess.run((train, monitor_ops))
-        print('Step', i, ':', monitors)
+        for monitor, value in monitors.items():
+            writer.writerow({'step': i,
+                             'monitor': monitor,
+                             'value': value})
+        fp.flush()
 
 
 def generate_and_test(features, labels, sess):
     loss, monitor_ops = generate_graph(
         features, labels,
-        [pair_cosine_loss, norm_ratio])
+        [pair_cosine_loss, norm_ratio, mean_based])
 
     optimizer = tf.train.GradientDescentOptimizer(0.001)
     train = optimizer.minimize(loss)
 
     sess.run(tf.global_variables_initializer())
 
-    run_test(sess, train, monitor_ops)
+    with open('out.csv', 'w') as fp:
+        run_test(sess, train, monitor_ops, fp)
 
 
 def get_features_labels():
