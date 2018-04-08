@@ -1,12 +1,14 @@
 #!python
 
 import csv
-import tensorflow as tf
-import numpy as np
+import time
 
+import numpy as np
+import tensorflow as tf
 from tensorflow.python.ops import math_ops
 
 BATCH_SIZE = 200
+LOSS = 'loss'
 
 ### HOW THIS WORKS
 #
@@ -21,34 +23,17 @@ BATCH_SIZE = 200
 # which encapsulates the whole workflow.
 
 
-def generate_graph(data, labels, monitors):
+def generate_mnist_cnn(data, labels):
     """Generate the graph.
 
     Args:
       data: the input data tensor.
       labels: the input labels tensor.
-      monitors: a list of functions. The functions will be applied to
-        the intermediate tensors at every stage of the graph, and
-        should return a dict of {name, tensor} pairs, to be used as
-        monitors.
 
-    Returns: a tuple of (loss, monitor_ops). The loss is an overall
+    Returns: a tuple of (intermediates, loss). The loss is an overall
       loss for the graph.
-
     """
-
-    losses = []
-    num_pairs = BATCH_SIZE // 2
-    monitor_ops = {}
-
-    def add_monitor_ops(tensor, in_tensor, layer_num):
-        for func in monitors:
-            ops = func(tensor,
-                       labels=labels,
-                       num_pairs=num_pairs,
-                       in_tensor=in_tensor)
-            for op_name, op in ops.items():
-                monitor_ops[op_name + str(layer_num)] = op
+    intermediates = []
 
     # Data is 2 x N x 28 x 28.
     #  2 is because we want pairs of images
@@ -72,8 +57,7 @@ def generate_graph(data, labels, monitors):
       activation=tf.nn.relu)
 
     # Shape: 2N x 28 x 28 x 32.
-
-    add_monitor_ops(conv1, conv_input, 0)
+    intermediates.append(conv1)
 
     # Pooling Layer #1
     pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
@@ -86,7 +70,7 @@ def generate_graph(data, labels, monitors):
         padding="same",
         activation=tf.nn.relu)
 
-    add_monitor_ops(conv2, conv1, 1)
+    intermediates.append(conv2)
 
     pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
 
@@ -95,19 +79,19 @@ def generate_graph(data, labels, monitors):
     dense = tf.layers.dense(inputs=pool2_flat, units=1024,
                             activation=tf.nn.relu)
 
-    add_monitor_ops(dense, conv2, 2)
+    intermediates.append(dense)
 
     dropout = tf.layers.dropout(inputs=dense, rate=0.4, training=True)
 
     # Logits Layer
     logits = tf.layers.dense(inputs=dropout, units=10)
 
-    add_monitor_ops(logits, dense, 3)
+    intermediates.append(logits)
 
     # Calculate Overall Loss
     loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
 
-    return loss, monitor_ops
+    return intermediates, loss
 
 
 ## Cosine loss-based monitor ops
@@ -219,36 +203,86 @@ def mean_based(tensor, labels=None, num_pairs=None, **kwargs):
                 axis=1))}
 
 
-COLUMNS = ['step', 'monitor', 'value']
+MONITORS = [pair_cosine_loss, norm_ratio, mean_based]
 
-def run_test(sess, train, monitor_ops, fp, num_iterations=1000):
-    writer = csv.DictWriter(fp, COLUMNS)
-    writer.writeheader()
+
+def generate_graph(features, labels):
+    """Generate a graph including the MNIST CNN model and monitor ops.
+
+    The returned monitor ops will include a special op called 'loss'
+    with the overall loss function.
+    """
+
+    intermediates, loss = generate_mnist_cnn(features, labels)
+
+    monitor_ops = {}
+
+    last_layer = features
+    layer_num = 0
+
+    for tensor in intermediates:
+        for func in MONITORS:
+            ops = func(tensor,
+                       labels=labels,
+                       num_pairs=BATCH_SIZE // 2,
+                       in_tensor = last_layer)
+            for op_name, op in ops.items():
+                monitor_ops[op_name + str(layer_num)] = op
+        last_layer = tensor
+        layer_num += 1
+
+    monitor_ops[LOSS] = loss
+
+    return monitor_ops
+
+
+COLUMNS = ['step', 'time', 'strategy', 'monitor', 'value']
+
+def train_one_op(sess, optimizer, monitor_ops, loss_name, writer,
+                 fp, strategy, base_time, num_iterations=1000):
+    train = optimizer.minimize(monitor_ops[loss_name])
 
     for i in range(num_iterations):
         if i % 10 == 0:
             print('Starting step', i)
 
         _, monitors = sess.run((train, monitor_ops))
+        step_time = time.perf_counter()
         for monitor, value in monitors.items():
             writer.writerow({'step': i,
+                             'time': step_time - base_time,
+                             'strategy': strategy,
                              'monitor': monitor,
                              'value': value})
         fp.flush()
 
 
 def generate_and_test(features, labels, sess):
-    loss, monitor_ops = generate_graph(
-        features, labels,
-        [pair_cosine_loss, norm_ratio, mean_based])
+    # loss, monitor_ops = generate_graph(
+    #     features, labels,
+    #     [pair_cosine_loss, norm_ratio, mean_based])
+
+    monitor_ops = generate_graph(features, labels)
 
     optimizer = tf.train.GradientDescentOptimizer(0.001)
-    train = optimizer.minimize(loss)
 
     sess.run(tf.global_variables_initializer())
 
     with open('out.csv', 'w') as fp:
-        run_test(sess, train, monitor_ops, fp)
+        writer = csv.DictWriter(fp, COLUMNS)
+        writer.writeheader()
+        # start_default = time.perf_counter()
+        # train_one_op(sess, optimizer, monitor_ops, LOSS, writer, fp,
+        #              'default', start_default)
+        start_cosine = time.perf_counter()
+        train_one_op(sess, optimizer, monitor_ops, 'cosine0', writer, fp,
+                     'cosine', start_cosine, num_iterations=100)
+        train_one_op(sess, optimizer, monitor_ops, 'cosine1', writer, fp,
+                     'cosine', start_cosine, num_iterations=100)
+        train_one_op(sess, optimizer, monitor_ops, 'cosine2', writer, fp,
+                     'cosine', start_cosine, num_iterations=100)
+        train_one_op(sess, optimizer, monitor_ops, LOSS, writer, fp,
+                     'cosine', start_cosine)
 
 
 def get_features_labels():
