@@ -49,44 +49,52 @@ def generate_mnist_cnn(data, labels):
     # conv_input is 2N x 28 x 28 x 1
 
     # Convolutional Layer.
-    conv1 = tf.layers.conv2d(
-      inputs=conv_input,
-      filters=32,
-      kernel_size=[5, 5],
-      padding="same",
-      activation=tf.nn.relu)
+    with tf.variable_scope('layer0'):
+        conv1 = tf.layers.conv2d(
+            inputs=conv_input,
+            filters=32,
+            kernel_size=[5, 5],
+            padding="same",
+            activation=tf.nn.relu)
 
-    # Shape: 2N x 28 x 28 x 32.
-    intermediates.append(conv1)
+        # Shape: 2N x 28 x 28 x 32.
+        intermediates.append(conv1)
 
-    # Pooling Layer #1
-    pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
+        # Pooling Layer #1
+        pool1 = tf.layers.max_pooling2d(inputs=conv1,
+                                        pool_size=[2, 2],
+                                        strides=2)
 
     # Convolutional Layer #2 and Pooling Layer #2
-    conv2 = tf.layers.conv2d(
-        inputs=pool1,
-        filters=64,
-        kernel_size=[5, 5],
-        padding="same",
-        activation=tf.nn.relu)
+    with tf.variable_scope('layer1'):
+        conv2 = tf.layers.conv2d(
+            inputs=pool1,
+            filters=64,
+            kernel_size=[5, 5],
+            padding="same",
+            activation=tf.nn.relu)
 
-    intermediates.append(conv2)
+        intermediates.append(conv2)
 
-    pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
+        pool2 = tf.layers.max_pooling2d(inputs=conv2,
+                                        pool_size=[2, 2],
+                                        strides=2)
 
     # Dense Layer
-    pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
-    dense = tf.layers.dense(inputs=pool2_flat, units=1024,
-                            activation=tf.nn.relu)
+    with tf.variable_scope('layer2'):
+        pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
+        dense = tf.layers.dense(inputs=pool2_flat, units=1024,
+                                activation=tf.nn.relu)
 
-    intermediates.append(dense)
+        intermediates.append(dense)
 
-    dropout = tf.layers.dropout(inputs=dense, rate=0.4, training=True)
+        dropout = tf.layers.dropout(inputs=dense, rate=0.4, training=True)
 
     # Logits Layer
-    logits = tf.layers.dense(inputs=dropout, units=10)
+    with tf.variable_scope('layer3'):
+        logits = tf.layers.dense(inputs=dropout, units=10)
 
-    intermediates.append(logits)
+        intermediates.append(logits)
 
     # Calculate Overall Loss
     loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
@@ -195,15 +203,24 @@ def mean_based(tensor, labels=None, num_pairs=None, **kwargs):
 
     return {
         'not normalized': tf.reduce_sum(
-            tf.subtract(flat_tensor, means_for_rows)),
+            tf.norm(
+                tf.subtract(flat_tensor, means_for_rows),
+                axis=0)),
         'cosine': tf.reduce_sum(
             tf.losses.cosine_distance(
                 tf.nn.l2_normalize(flat_tensor, axis=1),
                 tf.nn.l2_normalize(means_for_rows, axis=1),
-                axis=1))}
+                axis=1)),
+        'half-normalized': tf.reduce_sum(  # sum over dot products
+            tf.reduce_sum(                 # sum for each vector
+                tf.multiply(flat_tensor,
+                            tf.nn.l2_normalize(means_for_rows, axis=1)),
+                axis=1))
+        }
 
 
-MONITORS = [pair_cosine_loss, norm_ratio, mean_based]
+# MONITORS = [pair_cosine_loss, norm_ratio, mean_based]
+MONITORS = [mean_based]
 
 
 def generate_graph(features, labels):
@@ -215,93 +232,127 @@ def generate_graph(features, labels):
 
     intermediates, loss = generate_mnist_cnn(features, labels)
 
-    monitor_ops = {}
+    monitor_ops = []
 
     last_layer = features
     layer_num = 0
 
     for tensor in intermediates:
+        this_layer_monitors = {}
         for func in MONITORS:
             ops = func(tensor,
                        labels=labels,
                        num_pairs=BATCH_SIZE // 2,
                        in_tensor = last_layer)
             for op_name, op in ops.items():
-                monitor_ops[op_name + str(layer_num)] = op
+                this_layer_monitors[op_name + str(layer_num)] = op
+        monitor_ops.append(this_layer_monitors)
         last_layer = tensor
         layer_num += 1
 
-    monitor_ops[LOSS] = loss
+    # Add the overall loss as an extra layer at the end
+    monitor_ops.append({LOSS: loss})
 
     return monitor_ops
 
 
 COLUMNS = ['step', 'time', 'strategy', 'monitor', 'value']
 
-def train_one_op(sess, optimizer, monitor_ops, loss_name, writer,
+def train_one_op(sess, optimizer, monitor_ops, layer_num, loss_name, writer,
                  fp, strategy, base_time, num_iterations=1000):
-    train = optimizer.minimize(monitor_ops[loss_name])
+    # Monitor ops from different intermediate layers are guaranteed to
+    # have different names.
+    monitors_to_eval = {}
+    for i in range(layer_num + 1):
+        monitors_to_eval.update(monitor_ops[i])
 
+    variables = []
+    for i in range(layer_num + 1):
+        variables.extend(
+            tf.get_collection(
+                tf.GraphKeys.TRAINABLE_VARIABLES,
+                'layer' + str(i)))
+    train = optimizer.minimize(monitors_to_eval[loss_name], var_list=variables)
+
+    last_step = None
     for i in range(num_iterations):
         if i % 10 == 0:
             print('Starting step', i)
 
-        _, monitors = sess.run((train, monitor_ops))
+        step_start = time.perf_counter()
+        _, monitors = sess.run((train, monitors_to_eval))
         step_time = time.perf_counter()
+
+        if last_step:
+            writer.writerow({'step': i,
+                             'time': step_time - base_time,
+                             'strategy': strategy,
+                             'monitor': 'overhead',
+                             'value': step_start - last_step})
+        last_step = step_time
         for monitor, value in monitors.items():
             writer.writerow({'step': i,
                              'time': step_time - base_time,
                              'strategy': strategy,
                              'monitor': monitor,
                              'value': value})
+        # Add a monitor for step duration, called 'duration'.
+        writer.writerow({'step': i,
+                         'time': step_time - base_time,
+                         'strategy': strategy,
+                         'monitor': 'duration',
+                         'value': step_time - step_start})
         fp.flush()
 
 
-def generate_and_test(features, labels, sess):
-    # loss, monitor_ops = generate_graph(
-    #     features, labels,
-    #     [pair_cosine_loss, norm_ratio, mean_based])
+def generate_and_test(train_data, train_labels):
+    tf.reset_default_graph()
 
-    monitor_ops = generate_graph(features, labels)
+    with tf.Session() as sess:
+        dataset = tf.data.Dataset.from_tensor_slices((train_data, train_labels))
+        dataset_2 = dataset.shuffle(55000).repeat().batch(BATCH_SIZE)
+        features, labels = dataset_2.make_one_shot_iterator().get_next()
 
-    optimizer = tf.train.GradientDescentOptimizer(0.001)
+        monitor_ops = generate_graph(features, labels)
 
-    sess.run(tf.global_variables_initializer())
+        optimizer = tf.train.GradientDescentOptimizer(0.001)
 
-    with open('out.csv', 'w') as fp:
-        writer = csv.DictWriter(fp, COLUMNS)
-        writer.writeheader()
-        # start_default = time.perf_counter()
-        # train_one_op(sess, optimizer, monitor_ops, LOSS, writer, fp,
-        #              'default', start_default)
-        start_cosine = time.perf_counter()
-        train_one_op(sess, optimizer, monitor_ops, 'cosine0', writer, fp,
-                     'cosine', start_cosine, num_iterations=100)
-        train_one_op(sess, optimizer, monitor_ops, 'cosine1', writer, fp,
-                     'cosine', start_cosine, num_iterations=100)
-        train_one_op(sess, optimizer, monitor_ops, 'cosine2', writer, fp,
-                     'cosine', start_cosine, num_iterations=100)
-        train_one_op(sess, optimizer, monitor_ops, LOSS, writer, fp,
-                     'cosine', start_cosine)
+        sess.run(tf.global_variables_initializer())
+
+        with open('out.csv', 'w') as fp:
+            writer = csv.DictWriter(fp, COLUMNS)
+            writer.writeheader()
+            # start_default = time.perf_counter()
+            # train_one_op(sess, optimizer, monitor_ops, 4, LOSS, writer, fp,
+            #              'default', start_default)
+            # sess.run(tf.global_variables_initializer())
+            test_metric_name = 'half-normalized'
+            start_test = time.perf_counter()
+            train_one_op(sess, optimizer, monitor_ops, 0,
+                         test_metric_name + '0', writer, fp, test_metric_name,
+                         start_test, num_iterations=100)
+            train_one_op(sess, optimizer, monitor_ops, 1,
+                         test_metric_name + '1', writer, fp, test_metric_name,
+                         start_test, num_iterations=100)
+            train_one_op(sess, optimizer, monitor_ops, 2,
+                         test_metric_name + '2', writer, fp, test_metric_name,
+                         start_test, num_iterations=100)
+            train_one_op(sess, optimizer, monitor_ops, 4, LOSS, writer, fp,
+                         test_metric_name, start_test)
 
 
-def get_features_labels():
+def get_train_data_labels():
   mnist = tf.contrib.learn.datasets.load_dataset("mnist")
   train_data = mnist.train.images # Returns np.array
   train_labels = np.asarray(mnist.train.labels, dtype=np.int32)
 
-  dataset = tf.data.Dataset.from_tensor_slices((train_data, train_labels))
-  dataset_2 = dataset.shuffle(55000).repeat().batch(BATCH_SIZE)
-  features, labels = dataset_2.make_one_shot_iterator().get_next()
-
-  return features, labels
+  return train_data, train_labels
 
 
 def main():
   features, labels = get_features_labels()
 
-  sess = tf.Session()
-  generate_and_test(features, labels, sess)
+  generate_and_test(features, labels)
 
 
 if __name__ == '__main__':
